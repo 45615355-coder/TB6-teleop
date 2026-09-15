@@ -1,0 +1,8 @@
+{
+  "status": "aborted: ActAbort: Topic safety failed during full ACT execution: Topic controller/model state invalid",
+  "speed_scale": 0.08,
+  "completed_model_steps": 219,
+  "total_host_commands": 2744,
+  "wait_release_hold_commands": 45,
+  "trace_path": "/home/zzw/projects/data_collect/product/quest3_tb6_r5_omnipicker_data_product_v5/logs/act_real_full_20260831_161040.jsonl"
+}

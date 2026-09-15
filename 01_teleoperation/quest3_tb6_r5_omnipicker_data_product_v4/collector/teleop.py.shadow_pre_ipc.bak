@@ -1,0 +1,962 @@
+"""Standalone product v4 strict-incremental collector controller."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
+import numpy as np
+
+import config
+from home_motion import HomeMotionSession
+from jogany_io import (brake_payload, build_active_payload, build_brake,
+                       build_home_payload, build_home_sync_payload,
+                       build_release_payload, create_transport, sample_brake,
+                       strict_hold)
+from placo_ik import IncrementalRealRobotPlacoPlanner, orthonormalize_rotation
+from topic_io import TopicIO
+
+HOLD, ACTIVE = "HOLD", "ACTIVE"
+FRESH, STALE, WAITING = "FRESH", "STALE", "WAITING"
+ROBOT_SIDE_STOP, LOCAL_OPERATOR_EXIT, RPC_FATAL, LOCAL_ERROR, HOME_FATAL = (
+    "ROBOT_SIDE_STOP", "LOCAL_OPERATOR_EXIT", "RPC_FATAL", "LOCAL_ERROR", "HOME_FATAL"
+)
+R_XR_TO_ROBOT = np.array(((0., 0., -1.), (-1., 0., 0.), (0., 1., 0.)))
+HOME_JOINT_RAD = np.deg2rad(np.asarray(config.HOME_JOINT_DEG, dtype=float))
+
+
+@dataclass(frozen=True)
+class XrPose:
+    position: np.ndarray
+    rotation: np.ndarray
+
+
+@dataclass(frozen=True)
+class FrameEvent:
+    delta_position: np.ndarray
+    delta_rotation: np.ndarray
+    delta_rotation_deg: float
+    xr_new_frame: bool
+    state_changed: bool
+    transition: str
+
+
+@dataclass
+class HomeRuntime:
+    session: HomeMotionSession | None
+    phase: str = "MOTION"
+    brake: Any = None
+    hold_q: np.ndarray | None = None
+    brake_started_ns: int | None = None
+    settle_started_ns: int | None = None
+    settle_count: int = 0
+    settle_global_count: int | None = None
+    sync_session: HomeMotionSession | None = None
+    sync_start_command_q: np.ndarray | None = None
+    sync_target_actual_q: np.ndarray | None = None
+    sync_actual_start_q: np.ndarray | None = None
+    sync_hold_q: np.ndarray | None = None
+    sync_initial_gap_deg: float | None = None
+    sync_final_gap_deg: float | None = None
+    sync_actual_drift_deg: float = 0.0
+    sync_bypassed: bool = False
+    sync_pass: int = 1
+    sync_pass_initial_gap_deg: float | None = None
+
+
+class XrMonitor:
+    def __init__(self) -> None:
+        self.last_timestamp_ns: Optional[int] = None
+        self.last_change_s = time.perf_counter()
+
+    def observe(self, timestamp_ns: int, now_s: float, valid: bool) -> str:
+        if timestamp_ns == 0:
+            return WAITING
+        if timestamp_ns != self.last_timestamp_ns:
+            self.last_timestamp_ns, self.last_change_s = timestamp_ns, now_s
+        return FRESH if valid and now_s - self.last_change_s <= config.XR_STALE_S else STALE
+
+
+def quaternion_rotation(quaternion: Any) -> np.ndarray:
+    x, y, z, w = np.asarray(quaternion, dtype=float)
+    return orthonormalize_rotation(np.array(((1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)),
+                                             (2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w)),
+                                             (2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y))), dtype=float))
+
+
+def validate_xr_pose(raw: Any) -> Optional[XrPose]:
+    try:
+        values = np.asarray(raw, dtype=float)
+    except (TypeError, ValueError):
+        return None
+    if values.shape != (7,) or not np.all(np.isfinite(values)) or np.all(values[:3] == 0.0):
+        return None
+    magnitude = float(np.linalg.norm(values[3:]))
+    if not 1e-6 <= magnitude <= 10.0:
+        return None
+    return XrPose(values[:3].copy(), quaternion_rotation(values[3:] / magnitude))
+
+
+def _axis_angle(rotation: np.ndarray) -> tuple[np.ndarray, float]:
+    error = orthonormalize_rotation(rotation)
+    angle = math.acos(float(np.clip((np.trace(error)-1.0)*0.5, -1.0, 1.0)))
+    if angle < 1e-12:
+        return np.array((1., 0., 0.)), 0.0
+    axis = np.array((error[2, 1]-error[1, 2], error[0, 2]-error[2, 0], error[1, 0]-error[0, 1]))
+    return axis / np.linalg.norm(axis), angle
+
+
+def _scaled_rotation(rotation: np.ndarray) -> np.ndarray:
+    axis, angle = _axis_angle(rotation)
+    x, y, z = axis
+    theta = angle * config.ROTATION_SCALE
+    c, s, d = math.cos(theta), math.sin(theta), 1.0-math.cos(theta)
+    return orthonormalize_rotation(np.array(((c+x*x*d, x*y*d-z*s, x*z*d+y*s),
+                                             (y*x*d+z*s, c+y*y*d, y*z*d-x*s),
+                                             (z*x*d-y*s, z*y*d+x*s, c+z*z*d)), dtype=float))
+
+
+def frame_delta(previous: XrPose, current: XrPose) -> tuple[np.ndarray, np.ndarray, float]:
+    position = config.TRANSLATION_SCALE * (R_XR_TO_ROBOT @ (current.position - previous.position))
+    relative = R_XR_TO_ROBOT @ (current.rotation @ previous.rotation.T) @ R_XR_TO_ROBOT.T
+    _, angle = _axis_angle(relative)
+    return position, _scaled_rotation(relative), math.degrees(angle)
+
+
+class RealRobotSession:
+    """The frozen 03 HOLD/ACTIVE, one-frame-consumption arm clutch."""
+    def __init__(self) -> None:
+        self.state = HOLD
+        self.previous_pose: Optional[XrPose] = None
+        self.previous_timestamp: Optional[int] = None
+
+    def _hold(self, transition: str) -> FrameEvent:
+        self.state, self.previous_pose, self.previous_timestamp = HOLD, None, None
+        return FrameEvent(np.zeros(3), np.eye(3), 0.0, False, True, transition)
+
+    def consume(self, grip: float, pose: Optional[XrPose], timestamp_ns: int, xr_status: str) -> FrameEvent:
+        if grip <= config.GRIP_THRESHOLD:
+            return self._hold("ACTIVE → HOLD (RELEASE)") if self.state == ACTIVE else FrameEvent(np.zeros(3), np.eye(3), 0., False, False, "")
+        if self.state == ACTIVE and xr_status != FRESH:
+            return self._hold("ACTIVE → HOLD (XR_STALE)")
+        if pose is None or xr_status != FRESH:
+            return FrameEvent(np.zeros(3), np.eye(3), 0., False, False, "")
+        if self.state == HOLD:
+            self.state, self.previous_pose, self.previous_timestamp = ACTIVE, pose, timestamp_ns
+            return FrameEvent(np.zeros(3), np.eye(3), 0., True, True, "HOLD → ACTIVE")
+        if timestamp_ns == self.previous_timestamp:
+            return FrameEvent(np.zeros(3), np.eye(3), 0., False, False, "")
+        assert self.previous_pose is not None
+        position, rotation, angle = frame_delta(self.previous_pose, pose)
+        # Advance before PlaCo/RPC: a rejected frame's physical motion is dropped.
+        self.previous_pose, self.previous_timestamp = pose, timestamp_ns
+        return FrameEvent(position, rotation, angle, True, False, "")
+
+
+def topic_safe(topic: Any, *, stationary: bool = False) -> str:
+    if topic is None:
+        return "Topic unavailable"
+    try:
+        q = np.asarray(topic.q_actual_rad, dtype=float)
+        target = np.asarray(topic.q_target_rad, dtype=float)
+        dq = np.asarray(topic.dq_actual_rad_s, dtype=float)
+        enabled, errors = tuple(topic.enabled), tuple(topic.joint_error_code)
+    except Exception:
+        return "Topic fields unavailable"
+    if any(values.shape != (6,) or not np.all(np.isfinite(values)) for values in (q, target, dq)):
+        return "Topic q/target/dq invalid"
+    if not math.isfinite(float(topic.topic_age_ms)) or topic.topic_age_ms > config.TOPIC_STALE_MS:
+        return "Topic stale"
+    if not topic.controller_link_up or not all(enabled) or topic.model_state == 1 or topic.model_error_code != 0 or any(errors):
+        return "Topic controller/model state invalid"
+    if stationary and float(np.max(np.abs(dq))) > config.ROBOT_STATIONARY_LIMIT_RAD_S:
+        return "robot is not stationary"
+    return ""
+
+
+def button_rising(button: bool, previous_button: bool) -> bool:
+    return bool(button) and not bool(previous_button)
+
+
+def home_max_delta_deg(q_actual_rad: Any) -> float:
+    q_actual = np.asarray(q_actual_rad, dtype=float)
+    if q_actual.shape != (6,) or not np.all(np.isfinite(q_actual)):
+        raise ValueError("q_actual_rad must contain six finite values")
+    return float(np.max(np.abs(np.rad2deg(HOME_JOINT_RAD - q_actual))))
+
+
+def home_final_position_pass(q_actual_rad: Any) -> tuple[bool, float]:
+    error = home_max_delta_deg(q_actual_rad)
+    return error <= config.HOME_FINAL_TOLERANCE_DEG, error
+
+
+def home_start_reason(args: argparse.Namespace, transport: Any, state: str, home_active: bool, grip: float, topic: Any) -> str:
+    if not args.execute_motion:
+        return "execute-motion disabled"
+    if transport is None:
+        return "transport unavailable"
+    if state != HOLD or home_active:
+        return "arm is busy"
+    if grip > config.GRIP_THRESHOLD:
+        return "grip active"
+    safety = topic_safe(topic, stationary=True)
+    if safety:
+        return safety
+    try:
+        return "" if home_max_delta_deg(topic.q_actual_rad) <= config.HOME_MAX_DELTA_DEG else "too far from HOME"
+    except (AttributeError, TypeError, ValueError):
+        return "HOME distance unavailable"
+
+
+def home_start_allowed(args: argparse.Namespace, transport: Any, state: str, home_active: bool, grip: float, topic: Any) -> bool:
+    return not home_start_reason(args, transport, state, home_active, grip, topic)
+
+
+def max_joint_gap_deg(first: Any, second: Any) -> float:
+    first_q, second_q = np.asarray(first, dtype=float), np.asarray(second, dtype=float)
+    if any(values.shape != (6,) or not np.all(np.isfinite(values)) for values in (first_q, second_q)):
+        raise ValueError("joint vectors must contain six finite values")
+    return float(np.max(np.abs(np.rad2deg(first_q - second_q))))
+
+
+def start_original_home_motion(home: HomeRuntime, start_q: Any) -> None:
+    home.session = HomeMotionSession(start_q, HOME_JOINT_RAD, config.HOME_SPEED_RAD_S,
+                                     config.HOME_RAMP_DURATION_S, config.CONTROL_HZ)
+    home.phase = "MOTION"
+
+
+def create_home_runtime(command_q: Any, actual_q: Any) -> tuple[HomeRuntime, str]:
+    """Capture the one-shot HOME_SYNC target and select reject/bypass/sync."""
+    command = np.asarray(command_q, dtype=float).copy()
+    actual = np.asarray(actual_q, dtype=float).copy()
+    gap = max_joint_gap_deg(command, actual)
+    home = HomeRuntime(
+        session=None,
+        phase="SYNC",
+        sync_start_command_q=command,
+        sync_target_actual_q=actual.copy(),
+        sync_actual_start_q=actual.copy(),
+        sync_initial_gap_deg=gap,
+        sync_pass_initial_gap_deg=gap,
+    )
+    if gap > config.HOME_SYNC_MAX_INITIAL_GAP_DEG + 1e-12:
+        return home, "sync gap too large"
+    if gap <= config.HOME_SYNC_BYPASS_GAP_DEG + 1e-12:
+        home.sync_bypassed = True
+        home.sync_final_gap_deg = gap
+        start_original_home_motion(home, command)
+    else:
+        home.sync_session = HomeMotionSession(command, actual,
+                                              config.HOME_SYNC_SPEED_RAD_S,
+                                              config.HOME_RAMP_DURATION_S,
+                                              config.CONTROL_HZ)
+    return home, ""
+
+
+def update_home_sync_actual_drift(home: HomeRuntime, actual_q: Any) -> float:
+    if home.sync_actual_start_q is None:
+        return home.sync_actual_drift_deg
+    home.sync_actual_drift_deg = max_joint_gap_deg(actual_q, home.sync_actual_start_q)
+    return home.sync_actual_drift_deg
+
+
+def enter_home_sync_decel(home: HomeRuntime, transport: Any) -> None:
+    home.sync_hold_q = np.asarray(transport.last_accepted_command_q, dtype=float).copy()
+    home.phase = "SYNC_DECEL"
+    home.settle_count = 0
+    home.settle_global_count = None
+
+
+def home_sync_settle_ready(home: HomeRuntime, topic: Any, target_velocity: np.ndarray) -> bool:
+    home.settle_global_count, home.settle_count, _, _ = settle_update(
+        home.settle_global_count, int(topic.global_count), home.settle_count,
+        target_velocity, np.asarray(topic.dq_actual_rad_s, dtype=float),
+    )
+    return home.settle_count >= config.BRAKE_SETTLE_UNIQUE_SAMPLES
+
+
+def finish_home_sync(home: HomeRuntime, transport: Any, actual_q: Any) -> bool:
+    """Evaluate one sync pass; success alone enters the existing HOME motion."""
+    endpoint = np.asarray(transport.last_accepted_command_q, dtype=float)
+    home.sync_final_gap_deg = max_joint_gap_deg(endpoint, actual_q)
+    if home.sync_final_gap_deg > config.HOME_SYNC_READY_GAP_DEG + 1e-12:
+        return False
+    start_original_home_motion(home, endpoint)
+    return True
+
+
+def restart_home_sync_pass(home: HomeRuntime, transport: Any, actual_q: Any) -> bool:
+    """Start one bounded retry from the latest accepted command to a new fixed snapshot."""
+    if home.phase != "SYNC_DECEL" or home.settle_count < config.BRAKE_SETTLE_UNIQUE_SAMPLES:
+        raise RuntimeError("HOME_SYNC retry requires completed SYNC_DECEL settle")
+    if home.sync_pass >= config.HOME_SYNC_MAX_PASSES:
+        return False
+    start = np.asarray(transport.last_accepted_command_q, dtype=float).copy()
+    target = np.asarray(actual_q, dtype=float).copy()
+    gap = max_joint_gap_deg(start, target)
+    home.sync_pass += 1
+    home.sync_start_command_q = start
+    home.sync_target_actual_q = target
+    home.sync_actual_start_q = target.copy()
+    home.sync_hold_q = None
+    home.sync_final_gap_deg = None
+    home.sync_actual_drift_deg = 0.0
+    home.sync_pass_initial_gap_deg = gap
+    home.sync_session = HomeMotionSession(
+        start, target, config.HOME_SYNC_SPEED_RAD_S,
+        config.HOME_RAMP_DURATION_S, config.CONTROL_HZ,
+    )
+    home.phase = "SYNC"
+    home.settle_count = 0
+    home.settle_global_count = None
+    return True
+
+
+def reset_after_home_task(planner: Any, q_command: Any, controller: RealRobotSession) -> None:
+    planner.reset_to(np.asarray(q_command, dtype=float))
+    controller._hold("")
+
+
+def robot_side_stop_observed(topic: Any) -> bool:
+    """Web/robot-side STOP evidence: disconnected controller or disabled joints."""
+    try:
+        return not bool(topic.controller_link_up) or not all(tuple(topic.enabled))
+    except Exception:
+        return False
+
+
+def send_home_fatal_stop(transport: Any, topic: Any) -> tuple[str, Any]:
+    """Best-effort HOME-only true Stop without duplicating a robot-side STOP."""
+    if robot_side_stop_observed(topic):
+        return "SKIPPED_ROBOT_SIDE_STOP", None
+    if transport is None or getattr(transport, "client", None) is None:
+        return "UNAVAILABLE", None
+    try:
+        return "SENT", transport.send_true_stop_once()
+    except Exception as error:
+        return "UNAVAILABLE", f"{type(error).__name__}: {error}"
+
+
+def update_target_velocity(previous_q: np.ndarray | None, previous_count: int | None,
+                           latest: np.ndarray | None, latest_ns: int | None,
+                           topic: Any, now_ns: int) -> tuple[np.ndarray | None, int | None, np.ndarray | None, int | None]:
+    """Track controller q_target velocity from unique Topic samples."""
+    try:
+        q, count = np.asarray(topic.q_target_rad, dtype=float), int(topic.global_count)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None, None, None, None
+    if q.shape != (6,) or not np.all(np.isfinite(q)):
+        return None, None, None, None
+    if previous_q is None or previous_count is None:
+        return q.copy(), count, None, None
+    delta_count = count - previous_count
+    if delta_count < 0:
+        return q.copy(), count, None, None
+    if delta_count == 0:
+        return previous_q, previous_count, latest, latest_ns
+    velocity = (q - previous_q) / (delta_count * config.TOPIC_CONTROLLER_PERIOD_S)
+    return q.copy(), count, velocity, int(now_ns)
+
+
+def fresh_target_velocity(latest: np.ndarray | None, latest_ns: int | None, now_ns: int) -> np.ndarray | None:
+    if latest is None or latest_ns is None or (int(now_ns) - int(latest_ns)) / 1e6 > config.TOPIC_STALE_MS:
+        return None
+    return np.asarray(latest, dtype=float).copy()
+
+
+def settle_update(last_count: int | None, count: int, stationary_count: int,
+                  target_velocity: np.ndarray, actual_velocity: np.ndarray) -> tuple[int | None, int, bool, bool]:
+    target_ok = float(np.max(np.abs(target_velocity))) <= config.BRAKE_SETTLE_VELOCITY_RAD_S
+    actual_ok = float(np.max(np.abs(actual_velocity))) <= config.BRAKE_SETTLE_VELOCITY_RAD_S
+    if last_count is not None and count <= last_count:
+        return last_count, stationary_count, target_ok, actual_ok
+    return count, stationary_count + 1 if target_ok and actual_ok else 0, target_ok, actual_ok
+
+
+def _home_brake_velocity(velocity: np.ndarray) -> np.ndarray:
+    """HOME-only direction-preserving bound before constructing a brake segment."""
+    raw = np.asarray(velocity, dtype=float)
+    peak = float(np.max(np.abs(raw)))
+    scale = 1.0 if peak <= config.JOINT_SPEED_LIMIT_RAD_S else config.JOINT_SPEED_LIMIT_RAD_S / peak
+    return raw * scale
+
+
+def enter_home_settle(home: HomeRuntime, transport: Any, now_ns: int) -> None:
+    home.hold_q = np.asarray(transport.last_accepted_command_q, dtype=float).copy()
+    home.brake = None
+    home.phase = "SETTLE"
+    home.settle_started_ns = int(now_ns)
+    home.settle_count = 0
+    home.settle_global_count = None
+
+
+def begin_or_continue_home_brake(home: HomeRuntime, transport: Any,
+                                 target_velocity: np.ndarray, now_ns: int,
+                                 reason: str) -> None:
+    """Start another HOME brake segment, or freeze its accepted endpoint for SETTLE."""
+    if float(np.max(np.abs(target_velocity))) <= config.BRAKE_SETTLE_VELOCITY_RAD_S:
+        enter_home_settle(home, transport, now_ns)
+        return
+    home.brake = build_brake(transport.last_accepted_command_q,
+                             _home_brake_velocity(target_velocity), reason, now_ns)
+    if home.brake is None:
+        enter_home_settle(home, transport, now_ns)
+    else:
+        home.phase = "BRAKE"
+        if home.brake_started_ns is None:
+            home.brake_started_ns = int(now_ns)
+
+
+def home_settle_ready(home: HomeRuntime, topic: Any, target_velocity: np.ndarray,
+                      now_ns: int) -> bool:
+    home.settle_global_count, home.settle_count, _, _ = settle_update(
+        home.settle_global_count, int(topic.global_count), home.settle_count,
+        target_velocity, np.asarray(topic.dq_actual_rad_s, dtype=float),
+    )
+    elapsed_s = (int(now_ns) - int(home.settle_started_ns)) / 1e9
+    return (elapsed_s >= config.HOME_SETTLE_HOLD_S
+            and home.settle_count >= config.BRAKE_SETTLE_UNIQUE_SAMPLES)
+
+
+def reset_planner_after_home_pass(planner: Any, home: HomeRuntime, controller: RealRobotSession) -> None:
+    """Anchor PlaCo to the HOME brake's final accepted endpoint, then drop the XR session."""
+    if home.hold_q is None:
+        raise RuntimeError("HOME hold endpoint is unavailable")
+    reset_after_home_task(planner, home.hold_q, controller)
+
+
+def shutdown_release_cycles() -> int:
+    return math.ceil(config.JOINT_SPEED_LIMIT_RAD_S / config.RELEASE_DECEL_RAD_S2 / config.DT) + 3
+
+
+def local_shutdown_permitted(shutdown_mode: str, transport: Any, topic: Any) -> bool:
+    return (shutdown_mode == LOCAL_OPERATOR_EXIT and transport is not None and not bool(getattr(transport, "fatal_reason", ""))
+            and getattr(transport, "last_accepted_command_q", None) is not None and not topic_safe(topic))
+
+
+def send_shutdown_release(transport: Any, reader: Any) -> int:
+    endpoint = transport.last_accepted_command_q
+    if endpoint is None:
+        return 0
+    payload, submitted = build_release_payload(endpoint), 0
+    for cycle in range(shutdown_release_cycles()):
+        if getattr(transport, "fatal_reason", "") or topic_safe(reader.latest()):
+            break
+        try:
+            result = transport.submit_main(payload.text, payload.joint_pos, payload.joint_vel)
+        except Exception:
+            break
+        if not result.submitted or getattr(transport, "fatal_reason", ""):
+            break
+        submitted += 1
+        if cycle + 1 < shutdown_release_cycles():
+            time.sleep(config.DT)
+    return submitted
+
+
+def shutdown_release_if_local_and_healthy(shutdown_mode: str, transport: Any, reader: Any) -> int:
+    return send_shutdown_release(transport, reader) if local_shutdown_permitted(shutdown_mode, transport, reader.latest()) else 0
+
+
+def training_state_action(topic: Any, accepted_q_command: Any, gripper_snapshot: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    """Frozen training interface: actual observation, accepted absolute command action."""
+    q_actual = np.asarray(topic.q_actual_rad, dtype=float)
+    q_command = np.asarray(accepted_q_command, dtype=float)
+    actual = float(gripper_snapshot["actual_pos"])
+    command = float(gripper_snapshot["target_pos"])
+    if q_actual.shape != (6,) or q_command.shape != (6,):
+        raise ValueError("joint state/action must contain six values")
+    return np.concatenate((q_actual, (actual,))), np.concatenate((q_command, (command,)))
+
+
+class EpisodeRecorder:
+    """50 Hz main-loop episode controller; camera capture remains in its own thread."""
+    def __init__(self, logger: Any, camera: Any) -> None:
+        self.logger, self.camera = logger, camera
+        self.active = False
+        self.previous_b = False
+        self.previous_discard = False
+        self.step_index = 0
+
+    def buttons(self, b_button: bool, discard_button: bool) -> tuple[str, int, str | None]:
+        b_rising = button_rising(b_button, self.previous_b)
+        discard_rising = button_rising(discard_button, self.previous_discard)
+        self.previous_b, self.previous_discard = bool(b_button), bool(discard_button)
+        if discard_rising and self.active:
+            steps = len(self.logger.log_data)
+            self.logger.reset(); self.active = False; self.step_index = 0
+            return "DISCARD", steps, None
+        if b_rising and self.active:
+            steps = len(self.logger.log_data)
+            saved = self.logger.save() if steps else None
+            self.logger.reset(); self.active = False; self.step_index = 0
+            return "STOP+SAVE", steps, saved
+        if b_rising:
+            self.logger.reset(); self.active = True; self.step_index = 0
+            return "START", 0, None
+        return "", 0, None
+
+    def record(self, timestamp: float, topic: Any, accepted_q_command: Any, gripper_snapshot: dict[str, Any]) -> bool:
+        if not self.active:
+            return False
+        try:
+            state, action = training_state_action(topic, accepted_q_command, gripper_snapshot)
+            frames = self.camera.get_compressed_frames()
+            image = {}
+            for view, serial in config.CAM_SERIAL_DICT.items():
+                frame = frames.get(serial)
+                if frame is None or not isinstance(frame.get("color"), bytes):
+                    return False
+                image[view] = {"color": frame["color"], "timestamp": float(frame["timestamp"]), "frame_number": int(frame["frame_number"])}
+            self.logger.add_entry({"timestamp": timestamp, "step_index": self.step_index,
+                                   "q_actual": state[:6].copy(), "q_command": action[:6].copy(),
+                                   "gripper_actual_pos": float(state[6]), "gripper_command_pos": float(action[6]),
+                                   "image": image, "topic_global_count": int(topic.global_count)})
+            self.step_index += 1
+            return True
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+
+
+class GripperEventReporter:
+    """Event-only OmniPicker terminal output; the worker remains unmodified."""
+    def __init__(self) -> None:
+        self._ready = False
+        self._direction: str | None = None
+        self._previous_target: float | None = None
+
+    def observe(self, snapshot: dict[str, Any]) -> None:
+        ready = bool(snapshot.get("ready", False))
+        became_ready = ready and not self._ready
+        if became_ready:
+            print("[GRIPPER] READY", flush=True)
+        try:
+            target, actual = float(snapshot["target_pos"]), float(snapshot["actual_pos"])
+        except (KeyError, TypeError, ValueError):
+            self._ready = ready
+            return
+        if not all(math.isfinite(value) for value in (target, actual)):
+            self._ready = ready
+            return
+        direction = None
+        if became_ready:
+            direction = "OPENING" if target > actual else "CLOSING" if target < actual else None
+        elif ready and self._previous_target is not None:
+            target_delta = target - self._previous_target
+            direction = "OPENING" if target_delta > 1e-9 else "CLOSING" if target_delta < -1e-9 else None
+        if direction is not None and direction != self._direction:
+            print(f"[GRIPPER] {direction}", flush=True)
+            self._direction = direction
+        self._previous_target = target if ready else None
+        self._ready = ready
+
+
+def _json(value: Any) -> Any:
+    if isinstance(value, np.ndarray): return value.tolist()
+    if isinstance(value, (np.floating, float)): return float(value) if math.isfinite(float(value)) else None
+    if isinstance(value, (np.integer, int)): return int(value)
+    if isinstance(value, dict): return {key: _json(item) for key, item in value.items()}
+    return value
+
+
+def control_source(controller: RealRobotSession, home: HomeRuntime | None) -> str:
+    if home is None:
+        return "TELEOP" if controller.state == ACTIVE else "HOLD"
+    return {
+        "SYNC": "HOME_SYNC",
+        "SYNC_DECEL": "HOME_SYNC_DECEL",
+        "MOTION": "HOME_MOTION",
+        "BRAKE": "HOME_BRAKE",
+        "SETTLE": "HOME_SETTLE",
+    }.get(home.phase, f"HOME_{home.phase}")
+
+
+def diagnostic_fields(topic: Any, q_command: Any, target_dq: Any,
+                      controller: RealRobotSession, home: HomeRuntime | None,
+                      recording_active: bool) -> dict[str, Any]:
+    try:
+        actual = np.asarray(topic.q_actual_rad, dtype=float)
+        target = np.asarray(topic.q_target_rad, dtype=float)
+        actual_dq = np.asarray(topic.dq_actual_rad_s, dtype=float)
+    except Exception:
+        actual = target = actual_dq = None
+    try:
+        command = np.asarray(q_command, dtype=float)
+        command_actual_gap = max_joint_gap_deg(command, actual)
+        command_home_error = max_joint_gap_deg(command, HOME_JOINT_RAD)
+        actual_home_error = max_joint_gap_deg(actual, HOME_JOINT_RAD)
+    except (TypeError, ValueError):
+        command_actual_gap = command_home_error = actual_home_error = None
+    return {
+        "control_source": control_source(controller, home),
+        "topic_q_target": target,
+        "topic_dq_actual": actual_dq,
+        "target_dq": target_dq,
+        "q_command_actual_gap_deg": command_actual_gap,
+        "q_command_home_error_deg": command_home_error,
+        "q_actual_home_error_deg": actual_home_error,
+        "home_sync_initial_gap_deg": None if home is None else home.sync_initial_gap_deg,
+        "home_sync_final_gap_deg": None if home is None else home.sync_final_gap_deg,
+        "home_sync_actual_drift_deg": None if home is None else home.sync_actual_drift_deg,
+        "home_sync_target_q": None if home is None else home.sync_target_actual_q,
+        "home_sync_pass": None if home is None else home.sync_pass,
+        "home_sync_max_passes": config.HOME_SYNC_MAX_PASSES,
+        "home_sync_pass_initial_gap_deg": None if home is None else home.sync_pass_initial_gap_deg,
+        "recording_active": bool(recording_active),
+    }
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="product v4 Quest/PlaCo/JogAny data collector")
+    parser.add_argument("--ip", default=config.ROBOT_IP)
+    parser.add_argument("--execute-motion", action="store_true")
+    parser.add_argument("--confirm-controller-ready", action="store_true")
+    parser.add_argument("--confirm-robot-enabled", action="store_true")
+    parser.add_argument("--confirm-robot-stationary", action="store_true")
+    parser.add_argument("--connect-timeout-ms", type=int, default=1000)
+    parser.add_argument("--record-data", action="store_true")
+    return parser.parse_args(argv)
+
+
+def _require_motion_confirmations(args: argparse.Namespace) -> None:
+    if args.record_data and not args.execute_motion:
+        raise ValueError("--record-data requires --execute-motion")
+    if not args.execute_motion:
+        raise ValueError("product v4 execution requires --execute-motion")
+    missing = [name for name in ("confirm_controller_ready", "confirm_robot_enabled", "confirm_robot_stationary") if not getattr(args, name)]
+    if missing:
+        raise ValueError("missing confirmations: " + ", ".join(missing))
+
+
+def _wait_start_topic(reader: TopicIO) -> Any:
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        topic = reader.latest()
+        if not topic_safe(topic, stationary=True):
+            return topic
+        time.sleep(config.DT)
+    raise RuntimeError("startup Topic safety: " + topic_safe(reader.latest(), stationary=True))
+
+
+def _start_recording_peripherals() -> tuple[EpisodeRecorder, threading.Event, threading.Thread, threading.Thread | None]:
+    """Create exactly one RealSense owner; preview consumes only its completed cache."""
+    from camera_preview import CameraPreview
+    from data_logger import DataLogger
+    from realsense import RealSenseCameraInterface
+
+    camera = RealSenseCameraInterface(width=config.CAMERA_WIDTH, height=config.CAMERA_HEIGHT, fps=config.CAMERA_FPS,
+                                      serial_numbers=list(config.CAM_SERIAL_DICT.values()), enable_compression=True,
+                                      jpg_quality=config.CAMERA_JPG_QUALITY)
+    camera.start()
+    stop = threading.Event()
+
+    def camera_loop() -> None:
+        try:
+            while not stop.is_set():
+                if not camera.update_frames():
+                    print("[REC] camera bundle update failed", flush=True)
+                    return
+        except Exception as error:
+            print(f"[REC] camera stopped: {type(error).__name__}: {error}", flush=True)
+        finally:
+            camera.stop()
+
+    capture = threading.Thread(target=camera_loop, name="realsense-capture", daemon=True)
+    capture.start()
+    preview_thread = None
+    if config.CAMERA_PREVIEW_ENABLED:
+        try:
+            preview = CameraPreview(camera=camera, camera_serial_dict=config.CAM_SERIAL_DICT, hz=config.CAMERA_PREVIEW_HZ,
+                                    width=config.CAMERA_PREVIEW_WIDTH, height=config.CAMERA_PREVIEW_HEIGHT,
+                                    window_name=config.CAMERA_PREVIEW_WINDOW_NAME)
+            preview_thread = threading.Thread(target=preview.run, args=(stop,), name="camera-preview", daemon=True)
+            preview_thread.start()
+        except Exception as error:
+            print(f"[PREVIEW] stopped: {type(error).__name__}: {error}", flush=True)
+    return EpisodeRecorder(DataLogger(config.RAW_DATA_DIR), camera), stop, capture, preview_thread
+
+
+def run(args: argparse.Namespace) -> int:
+    _require_motion_confirmations(args)
+    import xrobotoolkit_sdk as xrt
+    from gripper_io import GripperIO
+
+    reader = TopicIO(); transport = planner = topic = None
+    controller = RealRobotSession(); home: HomeRuntime | None = None
+    gripper = None; recorder = None; recording_stop = capture_thread = preview_thread = None
+    xrt_started = False; fault = ""; shutdown_mode = LOCAL_ERROR; arm_low_seen = False
+    previous_a = False; gripper_events = GripperEventReporter()
+    previous_target_q = previous_target_count = latest_target_dq = latest_target_ns = None
+    try:
+        reader.start(args.ip)
+        initial_topic = _wait_start_topic(reader)
+        q_initial = np.asarray(initial_topic.q_actual_rad, dtype=float).copy()
+        transport = create_transport(args.ip, args.connect_timeout_ms)
+        warm = transport.submit_warmup_hold(strict_hold(q_initial).text, q_initial)
+        if not warm.submitted:
+            raise RuntimeError("seq1 warmup submit failed")
+        timeout = time.monotonic() + 2.5
+        while transport.callback_state(1) == "PENDING" and time.monotonic() < timeout:
+            time.sleep(0.002)
+        if transport.callback_state(1) == "PENDING":
+            transport.quarantine_warmup_timeout()
+        verify = transport.submit_verification_hold(strict_hold(q_initial).text, q_initial)
+        if not verify.submitted or not transport.wait_for_verification(2.0):
+            raise RuntimeError(transport.fatal_reason or "seq2 verification failed")
+        planner = IncrementalRealRobotPlacoPlanner(q_initial)
+        xrt.init(); xrt_started = True
+        gripper = GripperIO(vel=config.GRIPPER_VEL, force=config.GRIPPER_FORCE, acc=config.GRIPPER_ACC, dec=config.GRIPPER_DEC)
+        gripper.start()
+        if args.record_data:
+            recorder, recording_stop, capture_thread, preview_thread = _start_recording_peripherals()
+            print("[REC] READY", flush=True)
+        config.LOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        log_path = config.LOG_DIRECTORY / f"product_v4_{datetime.now():%Y%m%d_%H%M%S}.jsonl"
+        print("[SYS] quest3_tb6_r5_omnipicker_data_product_v4 READY", flush=True)
+        monitor, deadline, cycle = XrMonitor(), time.perf_counter() + config.DT, 0
+        with log_path.open("a", encoding="utf-8") as log:
+            while not fault:
+                now = time.perf_counter()
+                if now < deadline:
+                    time.sleep(deadline-now)
+                started = time.perf_counter(); now_ns = time.monotonic_ns(); cycle += 1
+                try:
+                    raw, grip, stamp = list(xrt.get_right_controller_pose()), float(xrt.get_right_grip()), int(xrt.get_time_stamp_ns())
+                    pose = validate_xr_pose(raw); xr_status = monitor.observe(stamp, started, pose is not None)
+                except Exception:
+                    grip, stamp, pose, xr_status = 0.0, 0, None, STALE
+                try: a_button = bool(xrt.get_A_button())
+                except Exception: a_button = False
+                try: trigger = xrt.get_right_trigger()
+                except Exception: trigger = None
+                try: b_button, discard = bool(xrt.get_B_button()), bool(xrt.get_right_axis_click())
+                except Exception: b_button, discard = False, False
+                a_rising = button_rising(a_button, previous_a); previous_a = a_button
+                if gripper is not None:
+                    gripper.set_trigger(trigger, xr_fresh=xr_status == FRESH)
+                    gripper_events.observe(gripper.get_snapshot())
+                topic = reader.latest(); safety = topic_safe(topic)
+                previous_target_q, previous_target_count, latest_target_dq, latest_target_ns = update_target_velocity(
+                    previous_target_q, previous_target_count, latest_target_dq, latest_target_ns, topic, now_ns
+                )
+                pending = payload = None
+                home_log = home
+                if safety:
+                    if home is not None and not robot_side_stop_observed(topic):
+                        fault, shutdown_mode = f"HOME Topic safety lost: {safety}", HOME_FATAL
+                        print(f"[HOME] FATAL | reason={fault}", flush=True)
+                    else:
+                        fault, shutdown_mode = safety, ROBOT_SIDE_STOP
+                        print(f"[STOP] ROBOT_SIDE_STOP | reason={safety}", flush=True)
+                elif transport.fatal_reason:
+                    fault = transport.fatal_reason
+                    shutdown_mode = HOME_FATAL if home is not None else RPC_FATAL
+                    print(f"[FAULT] {fault}", flush=True)
+                elif home is not None:
+                    previous = np.asarray(transport.last_accepted_command_q, dtype=float)
+                    phase = home.phase
+                    brake_sample = None
+                    if phase in ("SYNC", "SYNC_DECEL"):
+                        update_home_sync_actual_drift(home, topic.q_actual_rad)
+                    try:
+                        if phase == "SYNC":
+                            if home.sync_session is None:
+                                raise RuntimeError("HOME_SYNC session is unavailable")
+                            command = home.sync_session.next_target()
+                            payload = build_home_sync_payload(command, previous)
+                        elif phase == "SYNC_DECEL":
+                            if home.sync_hold_q is None:
+                                raise RuntimeError("HOME_SYNC endpoint is unavailable")
+                            payload = build_release_payload(home.sync_hold_q)
+                        elif phase == "MOTION":
+                            if home.session is None:
+                                raise RuntimeError("HOME motion session is unavailable")
+                            command = home.session.next_target()
+                            payload = build_home_payload(command, previous)
+                        elif phase == "BRAKE":
+                            if home.brake_started_ns is None:
+                                raise RuntimeError("HOME BRAKE start time is unavailable")
+                            if (now_ns - home.brake_started_ns) / 1e9 > config.BRAKE_TOTAL_TIMEOUT_S:
+                                raise RuntimeError("HOME BRAKE failed to settle within configured timeout")
+                            if home.brake is None:
+                                raise RuntimeError("HOME brake session is unavailable")
+                            brake_sample = sample_brake(home.brake, now_ns)
+                            payload = brake_payload(brake_sample["q_brake"], brake_sample["v_brake"], home.brake.brake_acc)
+                        elif phase == "SETTLE":
+                            if home.hold_q is None or home.settle_started_ns is None:
+                                raise RuntimeError("HOME settle state is unavailable")
+                            payload = strict_hold(home.hold_q)
+                        else:
+                            raise RuntimeError(f"unknown HOME phase: {phase!r}")
+                    except Exception as error:
+                        fault, shutdown_mode = f"HOME control exception: {error}", HOME_FATAL
+                    sent = None
+                    if not fault:
+                        try:
+                            sent = transport.submit_main(payload.text, payload.joint_pos, payload.joint_vel)
+                        except Exception as error:
+                            fault, shutdown_mode = f"HOME submit exception: {error}", HOME_FATAL
+                    if sent is not None and not sent.submitted:
+                        fault, shutdown_mode = "HOME submit failure", HOME_FATAL
+                    elif sent is not None and phase == "SYNC" and home.sync_session.motion_done:
+                        enter_home_sync_decel(home, transport)
+                    elif sent is not None and phase == "SYNC_DECEL":
+                        target_dq = fresh_target_velocity(latest_target_dq, latest_target_ns, now_ns)
+                        if target_dq is not None and home_sync_settle_ready(home, topic, target_dq):
+                            if finish_home_sync(home, transport, topic.q_actual_rad):
+                                print(f"[HOME] SYNC PASS | pass={home.sync_pass}/{config.HOME_SYNC_MAX_PASSES} | "
+                                      f"before={home.sync_pass_initial_gap_deg:.3f}deg | "
+                                      f"after={home.sync_final_gap_deg:.3f}deg", flush=True)
+                                print("[HOME] START", flush=True)
+                            else:
+                                previous_gap = home.sync_final_gap_deg
+                                if restart_home_sync_pass(home, transport, topic.q_actual_rad):
+                                    print(f"[HOME] SYNC RETRY | "
+                                          f"pass={home.sync_pass}/{config.HOME_SYNC_MAX_PASSES} | "
+                                          f"previous_gap={previous_gap:.3f}deg | "
+                                          f"new_gap={home.sync_pass_initial_gap_deg:.3f}deg", flush=True)
+                                else:
+                                    print(f"[HOME] FAILED | reason=sync did not converge after "
+                                          f"{config.HOME_SYNC_MAX_PASSES} passes | "
+                                          f"gap={home.sync_final_gap_deg:.3f}deg", flush=True)
+                                    reset_after_home_task(planner, transport.last_accepted_command_q, controller)
+                                    home = None; arm_low_seen = False
+                    elif sent is not None and phase == "MOTION" and home.session.motion_done:
+                        target_dq = fresh_target_velocity(latest_target_dq, latest_target_ns, now_ns)
+                        if target_dq is None:
+                            fault, shutdown_mode = "target velocity unavailable at HOME motion end", HOME_FATAL
+                        else:
+                            begin_or_continue_home_brake(home, transport, target_dq, now_ns, "HOME_END")
+                    elif sent is not None and phase == "BRAKE" and brake_sample["brake_terminal"]:
+                        target_dq = fresh_target_velocity(latest_target_dq, latest_target_ns, now_ns)
+                        if target_dq is None:
+                            fault, shutdown_mode = "target velocity unavailable during HOME braking", HOME_FATAL
+                        else:
+                            begin_or_continue_home_brake(home, transport, target_dq, now_ns, "HOME_BRAKE_CONTINUE")
+                    elif sent is not None and phase == "SETTLE":
+                        elapsed = (now_ns - home.settle_started_ns) / 1e9
+                        if elapsed > config.HOME_SETTLE_TIMEOUT_S:
+                            fault, shutdown_mode = "HOME failed to settle within configured timeout", HOME_FATAL
+                        else:
+                            target_dq = fresh_target_velocity(latest_target_dq, latest_target_ns, now_ns)
+                            if target_dq is not None and home_settle_ready(home, topic, target_dq, now_ns):
+                                position_passed, error = home_final_position_pass(topic.q_actual_rad)
+                                reset_planner_after_home_pass(planner, home, controller)
+                                home = None; arm_low_seen = False
+                                if position_passed:
+                                    print(f"[HOME] PASS | max_error={error:.3f}", flush=True)
+                                else:
+                                    print(f"[HOME] FAILED | max_error={error:.3f} | "
+                                          "reason=position tolerance", flush=True)
+                else:
+                    if a_rising:
+                        reason = home_start_reason(args, transport, controller.state, False, grip, topic)
+                        if reason:
+                            print(f"[HOME] IGNORED | reason={reason}", flush=True)
+                        else:
+                            candidate, sync_reason = create_home_runtime(
+                                transport.last_accepted_command_q, topic.q_actual_rad
+                            )
+                            home_log = candidate
+                            if sync_reason:
+                                print(f"[HOME] FAILED | reason={sync_reason} | "
+                                      f"gap={candidate.sync_initial_gap_deg:.3f}deg", flush=True)
+                            else:
+                                home = candidate
+                                controller._hold(""); arm_low_seen = False
+                                if home.sync_bypassed:
+                                    print(f"[HOME] SYNC BYPASS | gap={home.sync_initial_gap_deg:.3f}deg", flush=True)
+                                    print("[HOME] START", flush=True)
+                                else:
+                                    print(f"[HOME] SYNC START | "
+                                          f"pass={home.sync_pass}/{config.HOME_SYNC_MAX_PASSES} | "
+                                          f"gap={home.sync_initial_gap_deg:.3f}deg", flush=True)
+                    if home is None and not fault:
+                        if controller.state == HOLD and grip <= config.GRIP_THRESHOLD:
+                            arm_low_seen = True
+                        if controller.state == HOLD and not arm_low_seen:
+                            event = FrameEvent(np.zeros(3), np.eye(3), 0., False, False, "")
+                        else:
+                            event = controller.consume(grip, pose, stamp, xr_status)
+                        if event.state_changed and event.transition:
+                            print(f"[ARM] {event.transition}", flush=True)
+                        if event.xr_new_frame and controller.state == ACTIVE and not event.state_changed:
+                            pending = planner.propose(event.delta_position, event.delta_rotation)
+                            if pending is None:
+                                planner.rollback()
+                            else:
+                                try:
+                                    payload = build_active_payload(pending["q_command"], transport.last_accepted_command_q)
+                                except Exception as error:
+                                    planner.rollback(); fault = f"payload validation: {type(error).__name__}: {error}"
+                        if not fault and payload is None:
+                            payload = build_release_payload(planner.q_commit)
+                        if not fault:
+                            try:
+                                sent = transport.submit_main(payload.text, payload.joint_pos, payload.joint_vel)
+                            except Exception as error:
+                                if pending is not None: planner.rollback()
+                                sent = None; fault, shutdown_mode = f"JogAny submit exception: {error}", RPC_FATAL
+                            if sent is not None and not sent.submitted:
+                                if pending is not None: planner.rollback()
+                                fault, shutdown_mode = "JogAny submit failure", RPC_FATAL if transport.fatal_reason else LOCAL_ERROR
+                            elif sent is not None and pending is not None:
+                                planner.commit(pending)
+                if recorder is not None:
+                    event_name, steps, saved = recorder.buttons(b_button, discard)
+                    if event_name == "START": print(f"[REC] START | episode={cycle}", flush=True)
+                    elif event_name == "STOP+SAVE": print(f"[REC] STOP+SAVE | steps={steps} | file={saved}", flush=True)
+                    elif event_name == "DISCARD": print(f"[REC] DISCARD | steps={steps}", flush=True)
+                    snapshot = gripper.get_snapshot() if gripper is not None else {}
+                    recorder.record(started, topic, transport.last_accepted_command_q, snapshot)
+                diagnostic_home = home if home is not None else home_log
+                record = {"timestamp": started, "cycle": cycle, "state": controller.state,
+                          "home_phase": None if diagnostic_home is None else diagnostic_home.phase, "grip": grip,
+                          "xr_new_frame": False if home is not None else (pending is not None),
+                          "q_candidate": None if pending is None else pending["q_candidate"],
+                          "q_command": transport.last_accepted_command_q, "q_commit": planner.q_commit,
+                          "topic_q_actual": None if topic is None else topic.q_actual_rad,
+                          "fault": fault, "loop_duration_ms": (time.perf_counter()-started)*1000.0}
+                record.update(diagnostic_fields(
+                    topic, transport.last_accepted_command_q, latest_target_dq,
+                    controller, diagnostic_home,
+                    False if recorder is None else recorder.active,
+                ))
+                log.write(json.dumps(_json(record), ensure_ascii=False) + "\n")
+                deadline += config.DT
+                if time.perf_counter() >= deadline:
+                    deadline = time.perf_counter() + config.DT
+        return 0 if not fault else 1
+    except KeyboardInterrupt:
+        shutdown_mode = LOCAL_OPERATOR_EXIT
+        print("[EXIT] LOCAL_OPERATOR_EXIT", flush=True)
+        return 0
+    finally:
+        if transport is not None:
+            try:
+                if shutdown_mode == HOME_FATAL:
+                    stop_state, stop_detail = send_home_fatal_stop(transport, topic)
+                    print(f"[HOME] TRUE STOP | state={stop_state} | detail={stop_detail}", flush=True)
+                count = shutdown_release_if_local_and_healthy(shutdown_mode, transport, reader)
+                if count: print(f"[EXIT] controller deceleration frames={count}", flush=True)
+            finally:
+                transport.terminate_once()
+        if recording_stop is not None: recording_stop.set()
+        if preview_thread is not None: preview_thread.join(1.0)
+        if capture_thread is not None: capture_thread.join(2.0)
+        if gripper is not None: gripper.shutdown()
+        if xrt_started:
+            try: xrt.close()
+            except Exception: pass
+        reader.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(run(parse_args()))

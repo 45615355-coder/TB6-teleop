@@ -1,0 +1,270 @@
+{
+  "status": "complete",
+  "requested_max_chunks": 3,
+  "completed_chunks": 3,
+  "model_steps_per_replan": 10,
+  "speed_scale": 0.1,
+  "total_submitted_commands": 300,
+  "active_wait_maintenance_submissions": 40,
+  "chunks": [
+    {
+      "chunk_index": 0,
+      "source_observation_sequence": 0,
+      "source_observation_timestamp_ns": 29521865750778,
+      "inference_ms": 281.436426,
+      "current_q_actual": [
+        1.57065251428457,
+        -1.5702210821884746,
+        1.5686871014023582,
+        -1.57002933459021,
+        -1.5726179271667817,
+        0.0
+      ],
+      "command_anchor": [
+        1.57065251428457,
+        -1.5702210821884746,
+        1.5686871014023582,
+        -1.57002933459021,
+        -1.5726658640663478,
+        0.0
+      ],
+      "command_anchor_q_actual_max_abs_rad": 4.7936899566058955e-05,
+      "command_anchor_q_actual_max_abs_deg": 0.0027465820280776856,
+      "prediction_first_action": [
+        1.5493090152740479,
+        -1.5422950983047485,
+        1.5333753824234009,
+        -1.556494951248169,
+        -1.586299180984497,
+        0.02040889859199524,
+        99.07664489746094
+      ],
+      "prediction_action_9": [
+        1.551113247871399,
+        -1.5482127666473389,
+        1.5320730209350586,
+        -1.556671380996704,
+        -1.5847032070159912,
+        0.020842909812927246,
+        99.071044921875
+      ],
+      "first_resampled_command": [
+        1.5685181643835178,
+        -1.567428483800102,
+        1.5651559295044626,
+        -1.568675896256006,
+        -1.574029195758163,
+        0.002040889859199524
+      ],
+      "first_command_velocity_rad_s": [
+        -0.10671749505261063,
+        0.1396299194186268,
+        -0.17655859489478232,
+        0.06767191671021022,
+        -0.06816658459075642,
+        0.10204449295997621
+      ],
+      "execution_model_action_first_index": 0,
+      "execution_model_action_last_index": 9,
+      "ignored_model_action_count": 90,
+      "execution_command_count": 100,
+      "estimated_execution_duration_s": 2.0,
+      "max_actual_command_velocity_rad_s_by_joint": [
+        0.10671749505261063,
+        0.1396299194186379,
+        0.17655859489480452,
+        0.06767191671022132,
+        0.06816658459075642,
+        0.10204449295997632
+      ],
+      "max_actual_command_velocity_rad_s": 0.17655859489480452,
+      "last_execution_command": [
+        1.551113247871399,
+        -1.5482127666473389,
+        1.5320730209350586,
+        -1.556671380996704,
+        -1.5847032070159912,
+        0.020842909812927246
+      ],
+      "last_reaches_selected_action": true,
+      "action_after_prefix_not_executed": true,
+      "prediction_gripper_min": 99.02545928955078,
+      "prediction_gripper_max": 99.76641845703125,
+      "submitted_command_count": 100,
+      "status": "complete"
+    },
+    {
+      "chunk_index": 1,
+      "source_observation_sequence": 3,
+      "source_observation_timestamp_ns": 29522185781208,
+      "inference_ms": 9.00468,
+      "current_q_actual": [
+        1.43901778807595,
+        -1.3829795524831325,
+        1.323729544619384,
+        -1.5068005640624718,
+        -1.6534395398352935,
+        0.12017780721231243
+      ],
+      "command_anchor": [
+        1.551113247871399,
+        -1.5482127666473389,
+        1.5320730209350586,
+        -1.556671380996704,
+        -1.5847032070159912,
+        0.020842909812927246
+      ],
+      "command_anchor_q_actual_max_abs_rad": 0.20834347631567462,
+      "command_anchor_q_actual_max_abs_deg": 11.937201881971982,
+      "prediction_first_action": [
+        1.568245530128479,
+        -1.5481500625610352,
+        1.5284887552261353,
+        -1.551077961921692,
+        -1.574818730354309,
+        -0.017273634672164917,
+        99.84180450439453
+      ],
+      "prediction_action_9": [
+        1.5676755905151367,
+        -1.5439702272415161,
+        1.520002841949463,
+        -1.5483167171478271,
+        -1.5721032619476318,
+        -0.01858748495578766,
+        99.7739028930664
+      ],
+      "first_resampled_command": [
+        1.5528264760971071,
+        -1.5482064962387085,
+        1.5317145943641663,
+        -1.556112039089203,
+        -1.583714759349823,
+        0.017031255364418033
+      ],
+      "first_command_velocity_rad_s": [
+        0.08566141128540927,
+        0.00031352043151633424,
+        -0.01792132854461226,
+        0.027967095375058815,
+        0.049422383308406204,
+        -0.19058272242546068
+      ],
+      "execution_model_action_first_index": 0,
+      "execution_model_action_last_index": 9,
+      "ignored_model_action_count": 90,
+      "execution_command_count": 100,
+      "estimated_execution_duration_s": 2.0,
+      "max_actual_command_velocity_rad_s_by_joint": [
+        0.08566141128540927,
+        0.008304119110114083,
+        0.01792132854462336,
+        0.027967095375069917,
+        0.04942238330842841,
+        0.190582722425461
+      ],
+      "max_actual_command_velocity_rad_s": 0.190582722425461,
+      "last_execution_command": [
+        1.5676755905151367,
+        -1.5439702272415161,
+        1.520002841949463,
+        -1.5483167171478271,
+        -1.5721032619476318,
+        -0.01858748495578766
+      ],
+      "last_reaches_selected_action": true,
+      "action_after_prefix_not_executed": true,
+      "prediction_gripper_min": 99.59949493408203,
+      "prediction_gripper_max": 99.84180450439453,
+      "submitted_command_count": 100,
+      "status": "complete"
+    },
+    {
+      "chunk_index": 2,
+      "source_observation_sequence": 4,
+      "source_observation_timestamp_ns": 29522291228755,
+      "inference_ms": 9.084241,
+      "current_q_actual": [
+        1.4425171817442783,
+        -1.222966181731358,
+        1.1164024539958293,
+        -1.5102520208312338,
+        -1.6568909966040555,
+        -0.052395031225790784
+      ],
+      "command_anchor": [
+        1.5676755905151367,
+        -1.5439702272415161,
+        1.520002841949463,
+        -1.5483167171478271,
+        -1.5721032619476318,
+        -0.01858748495578766
+      ],
+      "command_anchor_q_actual_max_abs_rad": 0.4036003879536336,
+      "command_anchor_q_actual_max_abs_deg": 23.12459883958588,
+      "prediction_first_action": [
+        1.5677590370178223,
+        -1.5487109422683716,
+        1.5304489135742188,
+        -1.5474278926849365,
+        -1.5729258060455322,
+        -0.014797449111938477,
+        99.78963470458984
+      ],
+      "prediction_action_9": [
+        1.5665843486785889,
+        -1.5432841777801514,
+        1.5211528539657593,
+        -1.5435220003128052,
+        -1.570459008216858,
+        -0.01726500689983368,
+        99.72541046142578
+      ],
+      "first_resampled_command": [
+        1.5676839351654053,
+        -1.5444442987442017,
+        1.5210474491119386,
+        -1.5482278347015381,
+        -1.572185516357422,
+        -0.01820848137140274
+      ],
+      "first_command_velocity_rad_s": [
+        0.0004172325134277344,
+        -0.023703575134281785,
+        0.05223035812378374,
+        0.0044441223144509046,
+        -0.004112720489513055,
+        0.01895017921924591
+      ],
+      "execution_model_action_first_index": 0,
+      "execution_model_action_last_index": 9,
+      "ignored_model_action_count": 90,
+      "execution_command_count": 100,
+      "estimated_execution_duration_s": 2.0,
+      "max_actual_command_velocity_rad_s_by_joint": [
+        0.005145668983475016,
+        0.023703575134281785,
+        0.05223035812378374,
+        0.007794499397284493,
+        0.004112720489513055,
+        0.01895017921924591
+      ],
+      "max_actual_command_velocity_rad_s": 0.05223035812378374,
+      "last_execution_command": [
+        1.5665843486785889,
+        -1.5432841777801514,
+        1.5211528539657593,
+        -1.5435220003128052,
+        -1.570459008216858,
+        -0.01726500689983368
+      ],
+      "last_reaches_selected_action": true,
+      "action_after_prefix_not_executed": true,
+      "prediction_gripper_min": 99.59819030761719,
+      "prediction_gripper_max": 99.78963470458984,
+      "submitted_command_count": 100,
+      "status": "complete"
+    }
+  ],
+  "release_frames": 16
+}

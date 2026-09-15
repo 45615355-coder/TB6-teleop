@@ -1,0 +1,8 @@
+{
+  "status": "aborted: ActAbort: existing 50Hz payload validator rejected command 0: payload velocity exceeds PlaCo limit; no clamp is applied",
+  "speed_scale": 0.3,
+  "completed_model_steps": 0,
+  "total_host_commands": 0,
+  "wait_release_hold_commands": 37,
+  "trace_path": "/home/zzw/projects/data_collect/product/quest3_tb6_r5_omnipicker_data_product_v5/logs/act_real_full_20260902_110009.jsonl"
+}

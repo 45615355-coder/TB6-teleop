@@ -1,0 +1,99 @@
+{
+  "status": "aborted",
+  "requested_max_chunks": 1,
+  "completed_chunks": 0,
+  "model_steps_per_replan": 10,
+  "speed_scale": 0.1,
+  "total_submitted_commands": 0,
+  "active_wait_maintenance_submissions": 48,
+  "chunks": [
+    {
+      "chunk_index": 0,
+      "source_observation_sequence": 0,
+      "source_observation_timestamp_ns": 6399627356734,
+      "inference_ms": 395.008328,
+      "current_q_actual": [
+        1.5693582179962842,
+        -1.5716112522758927,
+        1.5724741164680833,
+        -1.5709401356819668,
+        -1.5657150136292575,
+        -0.00043143209609525804
+      ],
+      "command_anchor": [
+        1.5693582179962842,
+        -1.5715633153763264,
+        1.5724741164680833,
+        -1.5709401356819668,
+        -1.5658108874283898,
+        -0.0004793689956613978
+      ],
+      "command_anchor_q_actual_max_abs_rad": 9.587379913233995e-05,
+      "command_anchor_q_actual_max_abs_deg": 0.005493164056168094,
+      "prediction_first_action": [
+        1.5520005226135254,
+        -1.5563284158706665,
+        1.5268369913101196,
+        -1.5637836456298828,
+        -1.570217490196228,
+        -0.004946619272232056,
+        99.48219299316406
+      ],
+      "prediction_action_9": [
+        1.5444962978363037,
+        -1.5502204895019531,
+        1.5132014751434326,
+        -1.5561063289642334,
+        -1.5670474767684937,
+        -0.013108909130096436,
+        99.46929931640625
+      ],
+      "first_resampled_command": [
+        1.5676224484580084,
+        -1.5700398254257606,
+        1.567910403952287,
+        -1.5702244866767585,
+        -1.5662515477051737,
+        -0.0009260940233184636
+      ],
+      "first_command_velocity_rad_s": [
+        -0.08678847691379055,
+        0.07617449752829186,
+        -0.22818562578981183,
+        0.03578245026041316,
+        -0.022033013839195537,
+        -0.02233625138285329
+      ],
+      "execution_model_action_first_index": 0,
+      "execution_model_action_last_index": 9,
+      "ignored_model_action_count": 90,
+      "execution_command_count": 100,
+      "estimated_execution_duration_s": 2.0,
+      "max_actual_command_velocity_rad_s_by_joint": [
+        0.08678847691380165,
+        0.07617449752831407,
+        0.22818562578982293,
+        0.03578245026042426,
+        0.022033013839195537,
+        0.022336251382853306
+      ],
+      "max_actual_command_velocity_rad_s": 0.22818562578982293,
+      "last_execution_command": [
+        1.5444962978363037,
+        -1.5502204895019531,
+        1.5132014751434326,
+        -1.5561063289642334,
+        -1.5670474767684937,
+        -0.013108909130096436
+      ],
+      "last_reaches_selected_action": true,
+      "action_after_prefix_not_executed": true,
+      "prediction_gripper_min": 99.35360717773438,
+      "prediction_gripper_max": 99.84017944335938,
+      "submitted_command_count": 0,
+      "status": "validated"
+    }
+  ],
+  "reason": "ActAbort: existing 50Hz payload validator rejected command 0: payload velocity exceeds PlaCo limit; no clamp is applied",
+  "abort_release_frames": 16
+}

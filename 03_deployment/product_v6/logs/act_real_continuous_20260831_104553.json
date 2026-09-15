@@ -1,0 +1,12 @@
+{
+  "status": "aborted",
+  "requested_max_chunks": 1,
+  "completed_chunks": 0,
+  "model_steps_per_replan": 10,
+  "speed_scale": 0.1,
+  "total_submitted_commands": 0,
+  "active_wait_maintenance_submissions": 0,
+  "chunks": [],
+  "reason": "ActAbort: timed out waiting for fresh action chunk 0",
+  "abort_release_frames": 16
+}

@@ -1,0 +1,21 @@
+{
+  "lerobot_version": "0.6.1",
+  "torch_version": "2.11.0+cu130",
+  "device": "cuda",
+  "task_name": "pick_place_object_v2",
+  "checkpoint_path": "/home/robot/data_collect/training_results/pick_place_object_v2/act/v1/train/20260901_172324/checkpoints/120000/pretrained_model",
+  "evaluation_module_path": "/home/robot/teleop_act/03_deployment/deployment_support/02_evaluate/evaluate_act_checkpoints_v2.py",
+  "status": "operator_ctrl_c",
+  "checkpoint": "120000",
+  "sent_steps": 0,
+  "speed_scale": 0.3,
+  "temporal_ensemble_coeff": 0.01,
+  "chunk_size": 100,
+  "action_shape": [
+    7
+  ],
+  "real_mode_has_no_step_limit": true,
+  "max_planning_lead_s": 0.2,
+  "planning_lead_step_fraction": 0.8,
+  "warmup_ms": null
+}

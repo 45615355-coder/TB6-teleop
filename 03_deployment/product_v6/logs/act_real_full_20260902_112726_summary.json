@@ -1,0 +1,8 @@
+{
+  "status": "aborted: ActAbort: robot is too far from training HOME: 58.924deg > HOME_MAX_DELTA_DEG=20.000deg",
+  "speed_scale": 0.09,
+  "completed_model_steps": 0,
+  "total_host_commands": 0,
+  "wait_release_hold_commands": 0,
+  "trace_path": "/home/zzw/projects/data_collect/product/quest3_tb6_r5_omnipicker_data_product_v5/logs/act_real_full_20260902_112726.jsonl"
+}

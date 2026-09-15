@@ -1,0 +1,6 @@
+{
+  "status": "aborted",
+  "speed_scale": 0.4,
+  "reason": "ActAbort: existing 50Hz payload validator rejected command 0: payload velocity exceeds PlaCo limit; no clamp is applied",
+  "abort_release_frames": 16
+}

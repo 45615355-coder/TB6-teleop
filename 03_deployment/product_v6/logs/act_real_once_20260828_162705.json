@@ -1,0 +1,56 @@
+{
+  "status": "aborted",
+  "speed_scale": 0.2,
+  "source_observation_sequence": 92,
+  "source_observation_timestamp_ns": 27285024938664,
+  "inference_ms": 280.624195,
+  "current_q_actual": [
+    1.570700451184136,
+    -1.569022659699321,
+    1.5688309121010566,
+    -1.571323630878496,
+    -1.568591227603226,
+    -0.001533980786116473
+  ],
+  "command_anchor": [
+    1.570700451184136,
+    -1.569022659699321,
+    1.5688309121010566,
+    -1.571323630878496,
+    -1.568591227603226,
+    -0.0014860438865503332
+  ],
+  "command_anchor_q_actual_max_abs_rad": 4.7936899566139836e-05,
+  "command_anchor_q_actual_max_abs_deg": 0.00274658202808232,
+  "prediction_first_action": [
+    1.5698530673980713,
+    -1.5523673295974731,
+    1.5376278162002563,
+    -1.5509569644927979,
+    -1.5716800689697266,
+    -0.01213642954826355,
+    99.8743896484375
+  ],
+  "first_resampled_command": [
+    1.5705309744269231,
+    -1.5656915936789515,
+    1.5625902929208968,
+    -1.5672502976013565,
+    -1.569208995876526,
+    -0.003616121018892977
+  ],
+  "first_command_velocity_rad_s": [
+    -0.008473837860645261,
+    0.16655330101847943,
+    -0.3120309590079917,
+    0.20366666385697174,
+    -0.03088841366500894,
+    -0.1065038566171322
+  ],
+  "prediction_gripper_min": 99.69368743896484,
+  "prediction_gripper_max": 99.8743896484375,
+  "execution_command_count": 500,
+  "estimated_execution_duration_s": 10.0,
+  "reason": "ActAbort: existing 50Hz payload validator rejected command 0: payload velocity exceeds PlaCo limit; no clamp is applied",
+  "abort_release_frames": 16
+}
