@@ -35,3 +35,4 @@
 /01_teleoperation/third_party/libPXREARobotSDK.so filter=lfs diff=lfs merge=lfs -text
 /02_training/training_results/pick_place_object_v2/act/v1/smoke/20260915_092721/checkpoints/000020/training_state/optimizer_state.safetensors filter=lfs diff=lfs merge=lfs -text
 /02_training/training_results/pick_place_object_v2/act/v1/smoke/20260915_092721/checkpoints/000020/pretrained_model/model.safetensors filter=lfs diff=lfs merge=lfs -text
+/04_simulation/tb6_r5_mujoco/quest3_wrist_pivot_teleop/01_mujoco_incremental_baseline/logs/mujoco_incremental_20260914_153824.jsonl filter=lfs diff=lfs merge=lfs -text

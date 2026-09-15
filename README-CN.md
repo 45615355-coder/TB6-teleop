@@ -67,3 +67,8 @@ Torchvision==0.26.0
 Datasets==4.8.5
 Torchcodec==0.11.1
 
+7、Mujoco仿真：
+| mujoco | 3.13.0 | 仿真与模型加载 |
+| glfw | 2.10.2 | 图形窗口 |
+| pynput | 1.8.2 | 部分键盘控制脚本 |
+

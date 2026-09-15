@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>tb6_ik_test</name>
+  <version>0.0.1</version>
+  <description>TB6 R5 IK offline test</description>
+
+  <maintainer email="zzw@example.com">zzw</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>orocos_kdl</depend>
+  <depend>kdl_parser</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

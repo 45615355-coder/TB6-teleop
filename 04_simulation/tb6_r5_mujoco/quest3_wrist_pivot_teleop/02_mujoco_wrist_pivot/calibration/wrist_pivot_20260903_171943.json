@@ -1,0 +1,16 @@
+{
+  "valid": false,
+  "offset_m": [
+    0.03718327145284842,
+    -0.03510947863545844,
+    0.07127533274720112
+  ],
+  "offset_norm_m": 0.08772368109133455,
+  "rms_error_m": 0.019635560604994107,
+  "samples_total": 1721,
+  "samples_yaw": 653,
+  "samples_pitch": 526,
+  "samples_roll": 542,
+  "rank": 3,
+  "condition": 1.2285392302224727
+}

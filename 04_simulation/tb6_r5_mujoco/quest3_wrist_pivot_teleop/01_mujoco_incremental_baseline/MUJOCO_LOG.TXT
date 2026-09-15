@@ -1,0 +1,4 @@
+ERROR Mon Sep 14 15:32:17 2026: could not create window
+
+ERROR Mon Sep 14 15:33:33 2026: could not create window
+

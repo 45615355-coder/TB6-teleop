@@ -1,6 +1,6 @@
 # TB6-teleop
 
-基于 **Meta Quest 3、TB6-R5 机械臂、OmniPicker 夹爪和三路 Intel RealSense D435** 的遥操作与模仿学习项目，覆盖示教采集、数据转换、ACT 策略训练及实机部署。
+基于 **Meta Quest 3、TB6-R5 机械臂、OmniPicker 夹爪和三路 Intel RealSense D435** 的遥操作与模仿学习项目，覆盖 MuJoCo 仿真、手腕标定、示教采集、数据转换、ACT 策略训练及实机部署。
 
 当前任务围绕物体抓取与放置（`pick_place_object_v1` / `pick_place_object_v2`）展开。本仓库保存迁移后的项目源码、机器人模型、项目专用运行库、现有测试数据、训练产物及运行记录。
 
@@ -20,6 +20,7 @@ flowchart LR
 
 - **遥操作控制**：按 Quest 手柄相邻帧的位姿增量控制机械臂，丢弃未执行增量，避免历史动作积压。
 - **手腕补偿**：v4 Pro 在 v4 基础上增加 wrist-pivot 标定补偿，配置保存在产品目录内。
+- **MuJoCo 仿真**：提供 Quest 3 增量遥操作基线、手腕补偿版本、键盘控制、关节姿态查看和 IK 工具。
 - **示教采集**：记录机械臂实际状态、已接受的控制指令、夹爪状态以及 front / top / wrist 三路图像。
 - **数据转换**：将原始 PKL 转为 LeRobot 数据集，供 ACT 训练使用。
 - **训练管理**：提供环境与数据预检查、短程 smoke 训练、正式训练及按任务/版本归档的配置。
@@ -48,6 +49,13 @@ TB6-teleop/
 │   ├── deployment_support/        # 评估、Shadow、单次执行辅助代码
 │   ├── product_v6/                # 实机执行端与运行记录
 │   └── logs/
+├── 04_simulation/tb6_r5_mujoco/
+│   ├── quest3_wrist_pivot_teleop/  # 基础仿真、手腕补偿与标定
+│   ├── scripts/                   # Quest、键盘控制及姿态查看工具
+│   ├── ik_test/                   # C++ IK / FK 工具及现有构建产物
+│   ├── urdf/                      # 仿真机器人模型
+│   ├── meshes/                    # 模型网格
+│   └── run_python.sh              # 自动设置 SDK 库路径的启动入口
 ├── 07_docs/environment/            # 遥操作环境导出清单
 └── README-CN.md                    # 原有迁移说明，原样保留
 ```
@@ -159,6 +167,33 @@ v2 当前配置：120000 步、batch size 8、ResNet18、动作块长度 100、�
 - 部分日志、评估和辅助模块保留迁移前的绝对路径，需要在实际部署副本中核对。
 
 这些入口会执行真实运动。备份过程未启动机器人、采集、训练或部署程序，也未修改上述配置。
+
+### 5. MuJoCo 仿真与手腕标定
+
+仿真使用 `teleop_act_xr` 环境。新增环境记录列出的版本为 MuJoCo `3.13.0`、glfw `2.10.2`、pynput `1.8.2`；完整依赖和验证范围见 [仿真环境记录](04_simulation/tb6_r5_mujoco/README_environment.md)。
+
+基础 Quest 3 增量遥操作仿真：
+
+```bash
+conda activate teleop_act_xr
+cd "$TB6_ROOT/04_simulation/tb6_r5_mujoco/quest3_wrist_pivot_teleop/01_mujoco_incremental_baseline"
+./run_mujoco.sh
+```
+
+手腕补偿版本在 `02_mujoco_wrist_pivot` 目录中。需要重新标定时先运行 `./run_calibration.sh`，完成后使用 `./run_mujoco.sh` 启动仿真。有效标定写入该目录的 `calibration/current_user.json`；补偿启用时，缺失或无效的标定会阻止启动。
+
+其他脚本统一从仿真根目录启动，例如：
+
+```bash
+cd "$TB6_ROOT/04_simulation/tb6_r5_mujoco"
+./run_python.sh scripts/keyboard_tcp_control.py
+# 或查看指定关节角对应的姿态（单位：度）
+./run_python.sh scripts/view_pose.py 0 20 -30 0 10 0
+```
+
+统一入口为当前进程添加 `01_teleoperation/third_party` 的 SDK 动态库路径。仿真产生的有效手腕标定可按 [仿真使用说明](04_simulation/tb6_r5_mujoco/README-CN.md) 应用到实机 v4 Pro；本次备份不会自动替换实机标定。
+
+现有环境记录报告基础版 7 项、补偿版 14 项离线测试通过，但未验证该次迁移后的窗口交互和 Quest 端到端运行。这是项目已有记录，本次同步没有重新执行仿真测试。`ik_test/build` 保留旧机器的 CMake 缓存，重新编译时需要重新生成构建目录。
 
 ## 当前备份范围与状态
 

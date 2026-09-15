@@ -1,0 +1,4 @@
+source;share/tb6_ik_test/local_setup.bash
+source;share/tb6_ik_test/local_setup.dsv
+source;share/tb6_ik_test/local_setup.sh
+source;share/tb6_ik_test/local_setup.zsh
